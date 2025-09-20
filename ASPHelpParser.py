@@ -1,52 +1,92 @@
-import threading
-import re
-from xml.sax.saxutils import unescape
+# -*- coding: utf-8 -*-
 
+import re
 from burp import IBurpExtender, ITab, IContextMenuFactory
 from javax.swing import (
-    JPanel, BoxLayout, JMenuItem,
-    SwingUtilities, JSplitPane, JTextArea, JScrollPane
+    JPanel, JScrollPane, JTable, 
+    JMenuItem, JLabel, JSplitPane
 )
+from javax.swing.event import ListSelectionListener
+from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from java.util import ArrayList
-
+from java.awt import BorderLayout, Color, Desktop
+from java.awt.event import MouseAdapter
+from java.net import URI
+from java.lang import Integer, String
 
 class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
     def registerExtenderCallbacks(self, callbacks):
+        """Initialize the extension and set up the UI"""
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
         callbacks.setExtensionName("ASPHelpParser")
 
-        # --- UI Layout ---
-        self.panel = JPanel()
-        self.panel.setLayout(BoxLayout(self.panel, BoxLayout.Y_AXIS))
+        # Single source of truth for parsed entries
+        self._rows = []
 
-        # Plain text output area
-        self._outputArea = JTextArea()
-        self._outputArea.setEditable(False)
-        scroll = JScrollPane(self._outputArea)
+        # Build full UI
+        self._setupUI()
 
-        # Single pane layout (plain text)
-        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
-        split.setLeftComponent(scroll)
-        split.setRightComponent(None)
-        split.setDividerLocation(800)
+        callbacks.addSuiteTab(self)
+        callbacks.registerContextMenuFactory(self)
+        
+        print("[AHP] ASPHelpParser Extension loaded Successfully!")
 
-        self.panel.add(split)
+    def _setupUI(self):
+        """Create and configure the main user interface"""
+        self._mainPanel = JPanel(BorderLayout())
 
-        # Register tab + context menu
-        self._callbacks.addSuiteTab(self)
-        self._callbacks.registerContextMenuFactory(self)
+        # Create horizontal split pane
+        splitPane = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
+        splitPane.setResizeWeight(0.5)
 
-        print("[AHP] Extension loaded successfully.")
+        # Left panel - table
+        leftPanel = self._createTablePanel()
+        splitPane.setLeftComponent(leftPanel)
 
-    # ----- ITab -----
+        # Right panel - request/response viewers
+        rightPanel = self._createViewerPanel()
+        splitPane.setRightComponent(rightPanel)
+
+        self._mainPanel.add(splitPane, BorderLayout.CENTER)
+
+    def _createTablePanel(self):
+        """Create the table panel showing API endpoints"""
+        panel = JPanel(BorderLayout())
+        self._tablePanel = AHPTablePanel(self._rows, self)  # pass extender
+        panel.add(self._tablePanel, BorderLayout.CENTER)
+        return panel
+
+    def _createViewerPanel(self):
+        """Create request/response viewers"""
+        panel = JPanel(BorderLayout())
+
+        # Split vertically (top = request, bottom = response)
+        splitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+        splitPane.setResizeWeight(0.5)
+
+        # Burp provides text editors for request/response
+        self._requestViewer = self._callbacks.createMessageEditor(None, False)
+        requestPanel = JPanel(BorderLayout())
+        requestPanel.add(JLabel("Request"), BorderLayout.NORTH)
+        requestPanel.add(self._requestViewer.getComponent(), BorderLayout.CENTER)
+        splitPane.setTopComponent(requestPanel)
+        
+        self._responseViewer = self._callbacks.createMessageEditor(None, False)
+        responsePanel = JPanel(BorderLayout())
+        responsePanel.add(JLabel("Response"), BorderLayout.NORTH)
+        responsePanel.add(self._responseViewer.getComponent(), BorderLayout.CENTER)
+        splitPane.setBottomComponent(responsePanel)
+
+        panel.add(splitPane, BorderLayout.CENTER)
+        return panel
+
     def getTabCaption(self):
         return "AHP"
 
     def getUiComponent(self):
-        return self.panel
+        return self._mainPanel
 
-    # ----- Context menu -----
     def createMenuItems(self, invocation):
         items = ArrayList()
         selected = invocation.getSelectedMessages()
@@ -56,121 +96,174 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         menu_item = JMenuItem("Send to AHP")
 
         def on_menu(event, msgs=selected):
-            try:
-                msg = msgs[0]
-                resp = msg.getResponse()
-                if not resp:
-                    self._outputArea.setText("[AHP] No response found")
-                    return
+            msg = msgs[0]
+            response = msg.getResponse()
+            if not response:
+                return
 
-                analyzed = self._helpers.analyzeResponse(resp)
-                body_offset = analyzed.getBodyOffset()
-                body_bytes = resp[body_offset:]
-                # use helper to convert bytes to string safely
-                try:
-                    body_str = self._helpers.bytesToString(body_bytes)
-                except Exception:
-                    # fallback: try to call tostring (older objects)
-                    try:
-                        body_str = body_bytes.tostring()
-                    except Exception:
-                        body_str = str(body_bytes)
+            analyzed_req = self._helpers.analyzeRequest(msg)
+            url_req = analyzed_req.getUrl()
+            print("[AHP] Parsing {}".format(url_req))
+            analyzed = self._helpers.analyzeResponse(response)
+            body = response[analyzed.getBodyOffset():].tostring()
 
-                # Unescape common HTML entities to make link text nicer
-                body_str = unescape(body_str)
+            matches = re.findall(r'<a\s+href="([^"]+)">([^<]+)</a>', body)
+            if not matches:
+                return
 
-                # Extract <a href="...">text</a>
-                anchors = re.findall(r'<a\b[^>]*href=["\']?([^"\'>\s]+)["\']?[^>]*>(.*?)</a>',
-                                     body_str, re.IGNORECASE | re.DOTALL)
+            svc = msg.getHttpService()
+            proto = "https" if svc.getPort() == 443 else "http"
+            host = svc.getHost()
 
-                if not anchors:
-                    self._outputArea.setText("[AHP] No endpoints found in /Help response")
-                    return
+            for href, text in matches:
+                parts = text.strip().split(" ", 1)
+                method, url = (parts[0], parts[1]) if len(parts) == 2 else ("?", text.strip())
+                full_ref = "{}://{}/{}".format(proto, host, href.lstrip("/"))
 
-                host = msg.getHttpService().getHost()
-                port = msg.getHttpService().getPort()
-                proto = "https" if msg.getHttpService().getProtocol() == "https" else "http"
+                entry = {
+                    "method": method,
+                    "url": "{}://{}/{}".format(proto, host, url.lstrip("/")),
+                    "reference": full_ref
+                }
 
-                lines = ["#\tMethod\tURL"]
-                count = 1
-                for href, text in anchors:
-                    # Normalize whitespace in link text
-                    text_clean = re.sub(r'\s+', ' ', text).strip()
+                # Skip unwanted entries
+                if method == "?" and ("API" in url.upper() or "HOME" in url.upper()):
+                    continue
 
-                    # Only handle links whose text starts with an HTTP verb (GET/POST/PUT/DELETE/PATCH)
-                    m = re.match(r'^(GET|POST|PUT|DELETE|PATCH|OPTIONS)\s+(.+)$', text_clean, re.IGNORECASE)
-                    if not m:
-                        # skip non-api links like "Home" / "API"
-                        continue
+                # Deduplicate
+                if entry not in self._rows:
+                    self._rows.append(entry)
 
-                    method = m.group(1).upper()
-                    path_part = m.group(2).strip()
 
-                    # If href is an absolute URL, use it directly
-                    if href.startswith("http://") or href.startswith("https://"):
-                        full_url = href
-                    else:
-                        # ensure leading slash
-                        if not href.startswith("/"):
-                            href = "/" + href
-                        # remove any duplicate slashes when joining
-                        full_url = "{proto}://{host}:{port}{href}".format(
-                            proto=proto, host=host, port=port, href=href
-                        )
-
-                    # Some link text contains the full api path already (like "GET api/Services/...")
-                    # Use that path_part to create a cleaner URL if possible
-                    # If path_part already contains "http" or starts with "/", prefer href.
-                    if path_part.lower().startswith("http") or path_part.startswith("/"):
-                        display_url = full_url
-                    else:
-                        # path_part might be like: api/Services/GetTaxByMyKadNo?mykadno={mykadno}
-                        # ensure a leading slash
-                        if not path_part.startswith("/"):
-                            path_part2 = "/" + path_part
-                        else:
-                            path_part2 = path_part
-                        display_url = "{proto}://{host}:{port}{path}".format(
-                            proto=proto, host=host, port=port, path=path_part2
-                        )
-
-                    lines.append("{idx}\t{method}\t{url}".format(idx=count, method=method, url=display_url))
-                    count += 1
-
-                self._outputArea.setText("\n".join(lines))
-
-                # bring AHP tab to front
-                SwingUtilities.invokeLater(self._select_our_tab)
-
-            except Exception as e:
-                print("[AHP] Error parsing menu action:", e)
+            # Tell the table model data has changed
+            self._tablePanel._tableModel.fireTableDataChanged()
 
         menu_item.addActionListener(on_menu)
         items.add(menu_item)
         return items
 
-    # ----- select tab helper -----
-    def _select_our_tab(self):
-        try:
-            root = SwingUtilities.getRoot(self.panel)
-            if not root:
-                return
 
-            def find_tabbed(comp):
+# --- Custom Renderer for clickable Reference column ---
+class LinkCellRenderer(DefaultTableCellRenderer):
+    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
+        label = JLabel("{}".format(value))
+        if isSelected:
+            label.setForeground(table.getSelectionForeground())
+            label.setBackground(table.getSelectionBackground())
+            label.setOpaque(True)
+        else:
+            label.setForeground(Color.BLUE)
+        return label
+
+
+# --- Table Model ---
+class AHPTableModel(AbstractTableModel):
+    def __init__(self, log):
+        self._log = log
+        self._columnNames = ["ID", "Method", "URL", "Reference"]
+
+    def getRowCount(self):
+        return len(self._log)
+
+    def getColumnCount(self):
+        return len(self._columnNames)
+
+    def getColumnName(self, columnIndex):
+        return self._columnNames[columnIndex]
+
+    def getValueAt(self, rowIndex, columnIndex):
+        logEntry = self._log[rowIndex]
+        if columnIndex == 0:
+            return Integer(rowIndex + 1)
+        elif columnIndex == 1:
+            return logEntry["method"]
+        elif columnIndex == 2:
+            return logEntry["url"]
+        elif columnIndex == 3:
+            return logEntry["reference"]
+        return ""
+
+    def getColumnClass(self, columnIndex):
+        if columnIndex == 0:
+            return Integer
+        return String
+
+
+# --- Table Panel ---
+class AHPTablePanel(JPanel):
+    def __init__(self, log, extender):
+        JPanel.__init__(self, BorderLayout())
+        self._log = log
+        self._tableModel = AHPTableModel(self._log)
+        self._table = JTable(self._tableModel)
+
+        # Enable sorting
+        self._table.setAutoCreateRowSorter(True)
+
+        # Add selection listener
+        self._table.getSelectionModel().addListSelectionListener(
+            TableSelectionListener(extender, self._table)
+        )
+        
+        # Set column widths
+        columnModel = self._table.getColumnModel()
+        columnModel.getColumn(0).setPreferredWidth(30)   # ID
+        columnModel.getColumn(1).setPreferredWidth(40)   # Method
+        columnModel.getColumn(2).setPreferredWidth(350)  # URL (increased)
+        columnModel.getColumn(3).setPreferredWidth(450)  # Reference (increased)
+
+
+        # Set custom renderer for Reference column
+        self._table.getColumn("Reference").setCellRenderer(LinkCellRenderer())
+
+        # Add mouse listener for clickable links
+        self._table.addMouseListener(self.ClickHandler(self))
+
+        scrollPane = JScrollPane(self._table)
+        self.add(scrollPane, BorderLayout.CENTER)
+
+    class ClickHandler(MouseAdapter):
+        def __init__(self, parent):
+            self.parent = parent
+
+        def mouseClicked(self, event):
+            table = event.getSource()
+            row = table.rowAtPoint(event.getPoint())
+            col = table.columnAtPoint(event.getPoint())
+            if col == 3:  # Reference column
+                value = table.getValueAt(row, col)
                 try:
-                    cls_name = comp.getClass().getName()
-                    if "JTabbedPane" in cls_name:
-                        for i in range(comp.getTabCount()):
-                            if comp.getTitleAt(i) == self.getTabCaption():
-                                comp.setSelectedIndex(i)
-                                return True
-                    for child in comp.getComponents():
-                        if find_tabbed(child):
-                            return True
-                except Exception:
-                    pass
-                return False
+                    Desktop.getDesktop().browse(URI(value))
+                except Exception as e:
+                    print("[AHP] Failed to open link:", e)
 
-            find_tabbed(root)
-        except Exception:
-            pass
+
+class TableSelectionListener(ListSelectionListener):
+    def __init__(self, extender, table):
+        self._extender = extender
+        self._table = table
+
+    def valueChanged(self, event):
+        if event.getValueIsAdjusting():
+            return
+        row = self._table.getSelectedRow()
+        if row < 0:
+            return
+
+        # Convert from view → model index (because sorting is enabled)
+        row = self._table.convertRowIndexToModel(row)
+        entry = self._extender._rows[row]
+
+        # Build a "skeleton" HTTP request
+        method = entry["method"]
+        url = entry["url"]
+
+        host = url.split("://", 1)[1].split("/", 1)[0]
+        path = "/" + url.split("/", 3)[-1] if "/" in url[8:] else "/"
+
+        request_bytes = "{} {} HTTP/1.1\r\nHost: {}\r\n\r\n".format(
+            method, path, host
+        ).encode("utf-8")
+
+        self._extender._requestViewer.setMessage(request_bytes, True)
+        self._extender._responseViewer.setMessage(b"", False)
