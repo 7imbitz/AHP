@@ -4,17 +4,17 @@ import re, threading, HTMLParser
 from burp import IBurpExtender, ITab, IContextMenuFactory
 from javax.swing import (
     JPanel, JScrollPane, JTable, 
-    JMenuItem, JLabel, JSplitPane, SwingUtilities
+    JMenuItem, JLabel, JSplitPane, SwingUtilities,
+    KeyStroke, AbstractAction, JComponent, JPopupMenu
 )
 from javax.swing.event import ListSelectionListener
 from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from java.util import ArrayList
-from java.awt import BorderLayout, Color, Desktop
-from java.awt.event import MouseAdapter
+from java.awt import BorderLayout, Color, Desktop, Toolkit, Cursor, Font
+from java.awt.event import MouseAdapter, KeyEvent, InputEvent, ActionListener
 from java.net import URI, URL
 from java.lang import Integer, String
-
-
+from java.awt.font import TextAttribute
 
 class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
     def registerExtenderCallbacks(self, callbacks):
@@ -47,6 +47,27 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         # Right panel - request/response viewers
         rightPanel = self._createViewerPanel()
         splitPane.setRightComponent(rightPanel)
+        
+        # Add context popup item to the table
+        # popup = JPopupMenu()
+        # sendRequestMenu = JMenuItem("Send Crafted Request to Repeater")
+        # sendRequestMenu.addActionListener(SendRequestRepeater(self, True))   # True => use original requestResponse
+        # popup.add(sendRequestMenu)
+        # # attach popup to JTable component
+        # self._tablePanel._table.setComponentPopupMenu(popup)
+
+        # # Bind Cmd/Ctrl+R to the table
+        # # get table input/action maps
+        # try:
+        #     menu_mask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()
+        #     key_stroke = KeyStroke.getKeyStroke(KeyEvent.VK_R, menu_mask)
+        # except Exception:
+        #     key_stroke = KeyStroke.getKeyStroke(KeyEvent.VK_R, InputEvent.CTRL_DOWN_MASK)
+
+        # inputMap = self._tablePanel._table.getInputMap(JComponent.WHEN_FOCUSED)
+        # actionMap = self._tablePanel._table.getActionMap()
+        # inputMap.put(key_stroke, "AHP_SEND_TO_REPEATER")
+        # actionMap.put("AHP_SEND_TO_REPEATER", SendRequestToRepeaterAction(self))
 
         self._mainPanel.add(splitPane, BorderLayout.CENTER)
 
@@ -143,14 +164,23 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         return items
 
 class LinkCellRenderer(DefaultTableCellRenderer):
-    def getTableCellRendererComponent(self, table, value, isSelected):
-        label = JLabel("{}".format(value))
+    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, column):
+        label = JLabel(value)
+
+        # Get current font and add underline attribute
+        font = label.getFont()
+        attrs = font.getAttributes()
+        attrs[TextAttribute.UNDERLINE] = TextAttribute.UNDERLINE_ON
+        label.setFont(Font(font.getName(), font.getStyle(), font.getSize()).deriveFont(attrs))
+
         if isSelected:
             label.setForeground(table.getSelectionForeground())
             label.setBackground(table.getSelectionBackground())
             label.setOpaque(True)
         else:
             label.setForeground(Color.BLUE)
+
+        label.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
         return label
 
 class AHPTableModel(AbstractTableModel):
@@ -453,3 +483,4 @@ class TableSelectionListener(ListSelectionListener):
             return assembled, example_response_bytes
 
         return skeleton, example_response_bytes
+
