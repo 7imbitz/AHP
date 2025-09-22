@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import re, threading, HTMLParser
-from burp import IBurpExtender, ITab, IContextMenuFactory
+from burp import IBurpExtender, ITab, IContextMenuFactory, IHttpRequestResponse
 from javax.swing import (
     JPanel, JScrollPane, JTable, 
     JMenuItem, JLabel, JSplitPane, SwingUtilities,
@@ -49,25 +49,28 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         splitPane.setRightComponent(rightPanel)
         
         # Add context popup item to the table
-        # popup = JPopupMenu()
-        # sendRequestMenu = JMenuItem("Send Crafted Request to Repeater")
-        # sendRequestMenu.addActionListener(SendRequestRepeater(self, True))   # True => use original requestResponse
-        # popup.add(sendRequestMenu)
-        # # attach popup to JTable component
-        # self._tablePanel._table.setComponentPopupMenu(popup)
+        popup = JPopupMenu()
+        sendRequestMenu = JMenuItem("Send Crafted Request to Repeater")
+        sendRequestMenu.addActionListener(SendRequestRepeater(self, True))
+        popup.add(sendRequestMenu)
+        # Attach popup to JTable component
+        self._tablePanel._table.setComponentPopupMenu(popup)
+        reqComp = self._requestViewer.getComponent()
+        # Attach popup to request viewer component
+        reqComp.setComponentPopupMenu(popup)
 
-        # # Bind Cmd/Ctrl+R to the table
-        # # get table input/action maps
-        # try:
-        #     menu_mask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()
-        #     key_stroke = KeyStroke.getKeyStroke(KeyEvent.VK_R, menu_mask)
-        # except Exception:
-        #     key_stroke = KeyStroke.getKeyStroke(KeyEvent.VK_R, InputEvent.CTRL_DOWN_MASK)
+        # Get table input/action maps
+        im = self._mainPanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+        am = self._mainPanel.getActionMap()
 
-        # inputMap = self._tablePanel._table.getInputMap(JComponent.WHEN_FOCUSED)
-        # actionMap = self._tablePanel._table.getActionMap()
-        # inputMap.put(key_stroke, "AHP_SEND_TO_REPEATER")
-        # actionMap.put("AHP_SEND_TO_REPEATER", SendRequestToRepeaterAction(self))
+        try:
+            controlR = KeyStroke.getKeyStroke(KeyEvent.VK_R, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx())
+        except:
+            controlR = KeyStroke.getKeyStroke(KeyEvent.VK_R, InputEvent.CTRL_DOWN_MASK)
+
+        im.put(controlR, "SendRequestToRepeaterAction")
+        am.put("SendRequestToRepeaterAction", SendRequestToRepeaterAction(self))
+
 
         self._mainPanel.add(splitPane, BorderLayout.CENTER)
 
@@ -91,7 +94,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         requestPanel.add(JLabel("Expected Request"), BorderLayout.NORTH)
         requestPanel.add(self._requestViewer.getComponent(), BorderLayout.CENTER)
         splitPane.setTopComponent(requestPanel)
-        
+
         self._responseViewer = self._callbacks.createMessageEditor(None, False)
         responsePanel = JPanel(BorderLayout())
         responsePanel.add(JLabel("Expected Response"), BorderLayout.NORTH)
@@ -292,6 +295,22 @@ class TableSelectionListener(ListSelectionListener):
                     self._extender._responseViewer.setMessage(response_bytes, False)
                 else:
                     self._extender._responseViewer.setMessage(b"", False)
+
+                try:
+                    from urlparse import urlparse  # Python 2 Jython
+                except ImportError:
+                    from urllib.parse import urlparse
+
+                u = urlparse(entry["url"])
+                proto = u.scheme
+                host = u.hostname
+                port = u.port or (443 if proto == "https" else 80)
+
+                self._extender._currentlyDisplayedItem = DummyHttpRequestResponse(
+                    host, port, proto, request_bytes, response_bytes
+                )
+                self._extender._currentlyDisplayedItem._requestResponse = self._extender._currentlyDisplayedItem
+
             except Exception as e:
                 print("[AHP] Failed to update viewers:", e)
 
@@ -484,3 +503,148 @@ class TableSelectionListener(ListSelectionListener):
 
         return skeleton, example_response_bytes
 
+# AbstractAction bound to keystroke that sends selected table row(s)
+class SendRequestToRepeaterAction(AbstractAction):
+    def __init__(self, extender):
+        self._extender = extender
+
+    def actionPerformed(self, e):
+        print("Send to repeater via key stroke")
+        try:
+            table = self._extender._tablePanel._table
+        except Exception:
+            print("[AHP] Table not found for SendRequestToRepeaterAction")
+            return
+
+        sel = table.getSelectedRows()
+        if not sel or len(sel) == 0:
+            print("[AHP] No table row selected for Repeater")
+            return
+
+        for s in sel:
+            try:
+                model_row = table.convertRowIndexToModel(s)
+                entry = self._extender._rows[model_row]
+            except Exception as ex:
+                print("[AHP] Failed to resolve entry for row {}: {}".format(s, ex))
+                continue
+
+            try:
+                request_bytes, _ = self._extender._buildRequestAndResponseFromEntry(entry)
+            except Exception as ex:
+                print("[AHP] Failed to build crafted request for row {}: {}".format(model_row, ex))
+                request_bytes = None
+
+            # Determine host/port/proto from entry url as fallback
+            host = None
+            port = None
+            secure = False
+            try:
+                u = URL(entry.get("url"))
+                host = u.getHost()
+                port = u.getPort()
+                if port == -1:
+                    port = 443 if u.getProtocol().lower() == "https" else 80
+                secure = (u.getProtocol().lower() == "https")
+            except Exception:
+                pass
+
+            if (not host or not request_bytes) and hasattr(self._extender, "_currentlyDisplayedItem") and getattr(self._extender, "_currentlyDisplayedItem", None):
+                try:
+                    rr = self._extender._currentlyDisplayedItem._requestResponse
+                    svc = rr.getHttpService()
+                    host = svc.getHost()
+                    port = svc.getPort()
+                    secure = svc.getProtocol().lower() == "https"
+                    if request_bytes is None:
+                        request_bytes = rr.getRequest()
+                except Exception:
+                    pass
+
+            if not host or request_bytes is None:
+                print("[AHP] Cannot determine host or request for row {}; skipping".format(model_row))
+                continue
+
+            try:
+                try:
+                    self._extender._callbacks.sendToRepeater(host, port, secure, request_bytes)
+                except TypeError:
+                    self._extender._callbacks.sendToRepeater(host, port, secure, request_bytes, "AHP")
+                print("[AHP] Sent row {} to Repeater -> {}:{} {}".format(model_row, host, port, "https" if secure else "http"))
+            except Exception as ex:
+                print("[AHP] sendToRepeater failed for row {}: {}".format(model_row, ex))
+
+class SendRequestRepeater(ActionListener):
+    def __init__(self, extender, original=True):
+        self._extender = extender
+        self.original = original
+
+    def actionPerformed(self, e):
+        print("Send to repeater via right-click")
+        # Prefer the currently displayed item if available
+        current = getattr(self._extender, "_currentlyDisplayedItem", None)
+        if current is None:
+            print("[AHP] No currently displayed item to send")
+            return
+
+        try:
+            if self.original and hasattr(current, "_originalrequestResponse"):
+                rr = current._originalrequestResponse
+            elif hasattr(current, "_requestResponse"):
+                rr = current._requestResponse
+            else:
+                print("[AHP] No requestResponse available on currently displayed item")
+                return
+        except Exception as ex:
+            print("[AHP] Error getting current requestResponse:", ex)
+            return
+
+        try:
+            svc = rr.getHttpService()
+            host = svc.getHost()
+            port = svc.getPort()
+            proto = svc.getProtocol()
+            secure = (proto.lower() == "https")
+            req_bytes = rr.getRequest()
+        except Exception as ex:
+            print("[AHP] Failed to build request from currently displayed item:", ex)
+            return
+
+        try:
+            try:
+                self._extender._callbacks.sendToRepeater(host, port, secure, req_bytes)
+            except TypeError:
+                self._extender._callbacks.sendToRepeater(host, port, secure, req_bytes, "AHP")
+            print("[AHP] Sent currently displayed request to Repeater -> {}:{} {}".format(host, port, "https" if secure else "http"))
+        except Exception as ex:
+            print("[AHP] sendToRepeater failed:", ex)
+
+class DummyHttpRequestResponse(IHttpRequestResponse):
+    def __init__(self, host, port, protocol, request_bytes, response_bytes):
+        self._host = host
+        self._port = port
+        self._protocol = protocol
+        self._request = request_bytes
+        self._response = response_bytes
+
+    def getRequest(self):
+        return self._request
+
+    def getResponse(self):
+        return self._response
+
+    def getHttpService(self):
+        return self
+
+    def getHost(self):
+        return self._host
+
+    def getPort(self):
+        return self._port
+
+    def getProtocol(self):
+        return self._protocol
+
+    def setRequest(self, req): self._request = req
+    def setResponse(self, resp): self._response = resp
+    def setHttpService(self, svc): pass
