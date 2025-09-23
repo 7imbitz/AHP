@@ -13,7 +13,7 @@ from java.util import ArrayList
 from java.awt import BorderLayout, Color, Desktop, Toolkit, Cursor, Font
 from java.awt.event import MouseAdapter, KeyEvent, InputEvent, ActionListener
 from java.net import URI, URL
-from java.lang import Integer, String
+from java.lang import Integer, String, Throwable
 from java.awt.font import TextAttribute
 
 class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
@@ -48,6 +48,14 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         rightPanel = self._createViewerPanel()
         splitPane.setRightComponent(rightPanel)
         
+        def attachPopupRecursively(comp, popup):
+            if isinstance(comp, JComponent):
+                comp.setComponentPopupMenu(popup)
+            if hasattr(comp, "getComponentCount") and comp.getComponentCount() > 0:
+                for i in range(comp.getComponentCount()):
+                    child = comp.getComponent(i)
+                    attachPopupRecursively(child, popup)
+                    
         # Add context popup item to the table
         popup = JPopupMenu()
         sendRequestMenu = JMenuItem("Send Crafted Request to Repeater")
@@ -55,22 +63,31 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         popup.add(sendRequestMenu)
         # Attach popup to JTable component
         self._tablePanel._table.setComponentPopupMenu(popup)
-        reqComp = self._requestViewer.getComponent()
+        #reqComp = self._requestViewer.getComponent()
         # Attach popup to request viewer component
-        reqComp.setComponentPopupMenu(popup)
+        attachPopupRecursively(rightPanel, popup)
 
+        # Get table input/action maps
         # Get table input/action maps
         im = self._mainPanel.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
         am = self._mainPanel.getActionMap()
 
+        # Build mask: CTRL + (platform menu shortcut)
         try:
-            controlR = KeyStroke.getKeyStroke(KeyEvent.VK_R, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx())
-        except:
-            controlR = KeyStroke.getKeyStroke(KeyEvent.VK_R, InputEvent.CTRL_DOWN_MASK)
+            menu_mask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()
+        except Throwable:
+            # fallback if getMenuShortcutKeyMaskEx() not available
+            menu_mask = InputEvent.META_DOWN_MASK  # prefer META as fallback
 
-        im.put(controlR, "SendRequestToRepeaterAction")
+        ctrl_cmd_mask = InputEvent.CTRL_DOWN_MASK | menu_mask
+
+        # Create the KeyStroke for Ctrl+Cmd+R (or Ctrl+Ctrl+R on non-mac platforms,
+        # which effectively becomes Ctrl+R)
+        ctrlCmdR = KeyStroke.getKeyStroke(KeyEvent.VK_R, ctrl_cmd_mask)
+
+        # Put into input/action maps
+        im.put(ctrlCmdR, "SendRequestToRepeaterAction")
         am.put("SendRequestToRepeaterAction", SendRequestToRepeaterAction(self))
-
 
         self._mainPanel.add(splitPane, BorderLayout.CENTER)
 
@@ -532,7 +549,6 @@ class SendRequestToRepeaterAction(AbstractAction):
             try:
                 request_bytes, _ = self._extender._buildRequestAndResponseFromEntry(entry)
             except Exception as ex:
-                print("[AHP] Failed to build crafted request for row {}: {}".format(model_row, ex))
                 request_bytes = None
 
             # Determine host/port/proto from entry url as fallback
@@ -570,7 +586,7 @@ class SendRequestToRepeaterAction(AbstractAction):
                     self._extender._callbacks.sendToRepeater(host, port, secure, request_bytes)
                 except TypeError:
                     self._extender._callbacks.sendToRepeater(host, port, secure, request_bytes, "AHP")
-                print("[AHP] Sent row {} to Repeater -> {}:{} {}".format(model_row, host, port, "https" if secure else "http"))
+                print("[AHP] Sent row {} to Repeater -> {}:{} {}".format(model_row+1, host, port, "https" if secure else "http"))
             except Exception as ex:
                 print("[AHP] sendToRepeater failed for row {}: {}".format(model_row, ex))
 
